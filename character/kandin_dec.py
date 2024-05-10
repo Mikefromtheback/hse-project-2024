@@ -2,7 +2,6 @@ import argparse
 import logging
 import math
 import os
-import random
 import shutil
 from pathlib import Path
 
@@ -12,73 +11,28 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from diffusers import AutoPipelineForText2Image, DDPMScheduler, PriorTransformer
+from diffusers import DDPMScheduler, UNet2DConditionModel, VQModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_snr, cast_training_params
 from diffusers.utils import check_min_version, is_wandb_available, is_xformers_available, \
     convert_state_dict_to_diffusers
-from huggingface_hub import create_repo, upload_folder
+from PIL import Image
 from peft import LoraConfig, get_peft_model_state_dict
 from torch.utils import data
 from packaging import version
 from tqdm import tqdm
-from transformers import CLIPImageProcessor, CLIPTextModelWithProjection, CLIPTokenizer, CLIPVisionModelWithProjection
-from transformers.utils import logging
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+from transformers.utils import logging as hf_logging
 from diffusers.utils.torch_utils import is_compiled_module
-from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
-
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.28.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
-
-
-def save_model_card(
-    repo_id: str,
-    images: list = None,
-    base_model: str = None,
-    dataset_name: str = None,
-    repo_folder: str = None,
-):
-    img_str = ""
-    if images is not None:
-        for i, image in enumerate(images):
-            image.save(os.path.join(repo_folder, f"image_{i}.png"))
-            img_str += f"![img_{i}](./image_{i}.png)\n"
-
-    model_description = f"""
-# LoRA text2image fine-tuning - {repo_id}
-These are LoRA adaption weights for {base_model}. The weights were fine-tuned on the {dataset_name} dataset. You can find some example images in the following. \n
-{img_str}
-"""
-
-    model_card = load_or_create_model_card(
-        repo_id_or_path=repo_id,
-        from_training=True,
-        license="creativeml-openrail-m",
-        base_model=base_model,
-        model_description=model_description,
-        inference=True,
-    )
-
-    tags = [
-        "stable-diffusion",
-        "stable-diffusion-diffusers",
-        "text-to-image",
-        "diffusers",
-        "diffusers-training",
-        "lora",
-    ]
-    model_card = populate_model_card(model_card, tags=tags)
-
-    model_card.save(os.path.join(repo_folder, "README.md"))
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Example of finetuning Kandinsky 2.2 with LoRA.")
@@ -122,30 +76,6 @@ def parse_args():
     )
     parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing an image."
-    )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default="text",
-        help="The column of the dataset containing a caption or a list of captions."
-    )
-    parser.add_argument(
-        "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
-    )
-    parser.add_argument(
-        "--num_validation_images",
-        type=int,
-        default=4,
-        help="Number of images that should be generated during validation with `validation_prompt`."
-    )
-    parser.add_argument(
-        "--validation_epochs",
-        type=int,
-        default=1,
-        help=(
-            "Run fine-tuning validation every X epochs. The validation process consists of running the prompt"
-            " `args.validation_prompt` multiple times: `args.num_validation_images`."
-        )
     )
     parser.add_argument(
         "--max_train_samples",
@@ -192,7 +122,7 @@ def parse_args():
         "--gradient_accumulation_steps",
         type=int,
         default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
+        help="Number of updates steps to accumulate before performing a backward/update pass."
     )
     parser.add_argument(
         "--gradient_checkpointing",
@@ -251,17 +181,9 @@ def parse_args():
     )
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=0, help="Weight decay to use.")
+    parser.add_argument("--adam_weight_decay", type=float, default=0.0, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`."
-    )
     parser.add_argument(
         "--logging_dir",
         type=str,
@@ -340,11 +262,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.report_to == "wandb" and args.hub_token is not None:
-        raise ValueError(
-            "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
-            " Please use `huggingface-cli login` to authenticate with the Hub."
-        )
 
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -375,11 +292,11 @@ def main():
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_warning()
+        hf_logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
     else:
         datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
+        hf_logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
     # If passed along, set the training seed now.
@@ -391,53 +308,48 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-        if args.push_to_hub:
-            repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
-            ).repo_id
     # Load scheduler, image_processor, tokenizer and models.
-    noise_scheduler = DDPMScheduler(beta_schedule="squaredcos_cap_v2", prediction_type="sample")
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_prior_model_name_or_path, subfolder="tokenizer")
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_decoder_model_name_or_path, subfolder="scheduler")
     image_processor = CLIPImageProcessor.from_pretrained(
         args.pretrained_prior_model_name_or_path, subfolder="image_processor"
     )
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
         args.pretrained_prior_model_name_or_path, subfolder="image_encoder"
     )
-    text_encoder = CLIPTextModelWithProjection.from_pretrained(
-        args.pretrained_prior_model_name_or_path, subfolder="text_encoder"
-    )
-    prior = PriorTransformer.from_pretrained(args.pretrained_prior_model_name_or_path, subfolder="prior")
+
+    vae = VQModel.from_pretrained(args.pretrained_decoder_model_name_or_path, subfolder="movq")
+
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_decoder_model_name_or_path, subfolder="unet")
     # freeze parameters of models to save more memory
     image_encoder.requires_grad_(False)
-    prior.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    unet.requires_grad_(False)
+    vae.requires_grad_(False)
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    for param in prior.parameters():
+    for param in unet.parameters():
         param.requires_grad_(False)
 
-    prior_lora_config = LoraConfig(
+    unet_lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.rank,
         init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
     )
 
-    # Move image_encoder, text_encoder and prior to device and cast to weight_dtype
-    prior.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    # Move unet, vae and text_encoder to device and cast to weight_dtype
+    unet.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
 
-    prior.add_adapter(prior_lora_config)
+    unet.add_adapter(unet_lora_config)
 
     if args.mixed_precision == "fp16":
         # only upcast trainable parameters (LoRA) into fp32
-        cast_training_params(prior, dtype=torch.float32)
+        cast_training_params(unet, dtype=torch.float32)
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
@@ -447,14 +359,14 @@ def main():
                 logger.warning(
                     "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
-            prior.enable_xformers_memory_efficient_attention()
+            unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
-    lora_layers = filter(lambda p: p.requires_grad, prior.parameters())
+    lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
 
     if args.gradient_checkpointing:
-        prior.enable_gradient_checkpointing()
+        unet.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -520,42 +432,32 @@ def main():
     image_column = args.image_column
     if image_column not in column_names:
         raise ValueError(f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}")
-    caption_column = args.caption_column
-    if caption_column not in column_names:
-        raise ValueError(
-            f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-        )
 
-    # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        text_input_ids = inputs.input_ids
-        text_mask = inputs.attention_mask.bool()
-        return text_input_ids, text_mask
+    def center_crop(image):
+        width, height = image.size
+        new_size = min(width, height)
+        left = (width - new_size) / 2
+        top = (height - new_size) / 2
+        right = (width + new_size) / 2
+        bottom = (height + new_size) / 2
+        return image.crop((left, top, right, bottom))
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
         return model
 
+    def train_transforms(img):
+        img = center_crop(img)
+        img = img.resize((args.resolution, args.resolution), resample=Image.BICUBIC, reducing_gap=1)
+        img = np.array(img).astype(np.float32) / 127.5 - 1
+        img = torch.from_numpy(np.transpose(img, [2, 0, 1]))
+        return img
+
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
+        examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["clip_pixel_values"] = image_processor(images, return_tensors="pt").pixel_values
-        examples["text_input_ids"], examples["text_mask"] = tokenize_captions(examples)
         return examples
 
     with accelerator.main_process_first():
@@ -565,11 +467,11 @@ def main():
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         clip_pixel_values = torch.stack([example["clip_pixel_values"] for example in examples])
         clip_pixel_values = clip_pixel_values.to(memory_format=torch.contiguous_format).float()
-        text_input_ids = torch.stack([example["text_input_ids"] for example in examples])
-        text_mask = torch.stack([example["text_mask"] for example in examples])
-        return {"clip_pixel_values": clip_pixel_values, "text_input_ids": text_input_ids, "text_mask": text_mask}
+        return {"pixel_values": pixel_values, "clip_pixel_values": clip_pixel_values}
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -593,10 +495,9 @@ def main():
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
-    clip_mean = prior.clip_mean.clone()
-    clip_std = prior.clip_std.clone()
-    prior, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        prior, optimizer, train_dataloader, lr_scheduler
+    # Prepare everything with our `accelerator`.
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
     )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -659,48 +560,31 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
-    clip_mean = clip_mean.to(weight_dtype).to(accelerator.device)
-    clip_std = clip_std.to(weight_dtype).to(accelerator.device)
-
     for epoch in range(first_epoch, args.num_train_epochs):
-        prior.train()
+        unet.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(prior):
+            with accelerator.accumulate(unet):
                 # Convert images to latent space
-                text_input_ids, text_mask, clip_images = (
-                    batch["text_input_ids"],
-                    batch["text_mask"],
-                    batch["clip_pixel_values"].to(weight_dtype),
-                )
-                with torch.no_grad():
-                    text_encoder_output = text_encoder(text_input_ids)
-                    prompt_embeds = text_encoder_output.text_embeds
-                    text_encoder_hidden_states = text_encoder_output.last_hidden_state
+                images = batch["pixel_values"].to(weight_dtype)
+                clip_images = batch["clip_pixel_values"].to(weight_dtype)
+                latents = vae.encode(images).latents
+                image_embeds = image_encoder(clip_images).image_embeds
+                # Sample noise that we'll add to the latents
+                noise = torch.randn_like(latents)
+                bsz = latents.shape[0]
+                # Sample a random timestep for each image
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = timesteps.long()
 
-                    image_embeds = image_encoder(clip_images).image_embeds
-                    # Sample noise that we'll add to the image_embeds
-                    noise = torch.randn_like(image_embeds)
-                    bsz = image_embeds.shape[0]
-                    # Sample a random timestep for each image
-                    timesteps = torch.randint(
-                        0, noise_scheduler.config['num_train_timesteps'], (bsz,), device=image_embeds.device
-                    )
-                    timesteps = timesteps.long()
-                    image_embeds = (image_embeds - clip_mean) / clip_std
-                    noisy_latents = noise_scheduler.add_noise(image_embeds, noise, timesteps)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                    target = image_embeds
+                target = noise
 
                 # Predict the noise residual and compute loss
-                model_pred = prior(
-                    noisy_latents,
-                    timestep=timesteps,
-                    proj_embedding=prompt_embeds,
-                    encoder_hidden_states=text_encoder_hidden_states,
-                    attention_mask=text_mask,
-                    return_dict=False
-                )[0]
+                added_cond_kwargs = {"image_embeds": image_embeds}
+
+                model_pred = unet(noisy_latents, timesteps, None, added_cond_kwargs=added_cond_kwargs).sample[:, :4]
 
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -712,6 +596,11 @@ def main():
                     mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
                         dim=1
                     )[0]
+                    if noise_scheduler.config['prediction_type'] == "epsilon":
+                        mse_loss_weights = mse_loss_weights / snr
+                    elif noise_scheduler.config['prediction_type'] == "v_prediction":
+                        mse_loss_weights = mse_loss_weights / (snr + 1)
+
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
@@ -758,19 +647,14 @@ def main():
                                     shutil.rmtree(removing_checkpoint)
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        torch_path = os.path.join(save_path, 'unet_lora_state_dict.pth')
                         accelerator.save_state(save_path)
 
-                        unwrapped_prior = unwrap_model(prior)
-                        prior_lora_state_dict = convert_state_dict_to_diffusers(
-                            get_peft_model_state_dict(unwrapped_prior)
+                        unwrapped_unet = unwrap_model(unet)
+                        unet_lora_state_dict = convert_state_dict_to_diffusers(
+                            get_peft_model_state_dict(unwrapped_unet)
                         )
-
-                        AutoPipelineForText2Image.save_lora_weights(
-                            save_directory=save_path,
-                            unet_lora_layers=prior_lora_state_dict,
-                            safe_serialization=True,
-                        )
-
+                        torch.save(unet_lora_state_dict, torch_path)
                         logger.info(f"Saved state to {save_path}")
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -779,111 +663,19 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-        if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                logger.info(
-                    f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-                    f" {args.validation_prompt}."
-                )
-                # create pipeline
-                pipeline = AutoPipelineForText2Image.from_pretrained(
-                    args.pretrained_decoder_model_name_or_path,
-                    prior=unwrap_model(prior),
-                    torch_dtype=weight_dtype,
-                )
-                pipeline = pipeline.to(accelerator.device)
-                pipeline.set_progress_bar_config(disable=True)
-
-                # run inference
-                generator = torch.Generator(device=accelerator.device)
-                if args.seed is not None:
-                    generator = generator.manual_seed(args.seed)
-                images = []
-                with torch.autocast(accelerator.device.type):
-                    for _ in range(args.num_validation_images):
-                        images.append(
-                            pipeline(args.validation_prompt, num_inference_steps=30, generator=generator).images[0]
-                        )
-
-                for tracker in accelerator.trackers:
-                    if tracker.name == "tensorboard":
-                        np_images = np.stack([np.asarray(img) for img in images])
-                        tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-                    if tracker.name == "wandb":
-                        tracker.log(
-                            {
-                                "validation": [
-                                    wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                    for i, image in enumerate(images)
-                                ]
-                            }
-                        )
-
-                del pipeline
-                torch.cuda.empty_cache()
 
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unwrapped_prior = unwrap_model(prior)
-        prior_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_prior))
-        AutoPipelineForText2Image.save_lora_weights(
-            save_directory=args.output_dir,
-            unet_lora_layers=prior_lora_state_dict,
-            safe_serialization=True,
-        )
-
-        if args.push_to_hub:
-            save_model_card(
-                repo_id,
-                images=images,
-                base_model=args.pretrained_prior_model_name_or_path,
-                dataset_name=args.dataset_name,
-                repo_folder=args.output_dir,
-            )
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
-
-        # Final inference
-        # Load previous pipeline
-        if args.validation_prompt is not None:
-            pipeline = AutoPipelineForText2Image.from_pretrained(
-                args.pretrained_decoder_model_name_or_path, torch_dtype=weight_dtype
-            )
-            pipeline = pipeline.to(accelerator.device)
-
-            # load attention processors
-            pipeline.load_lora_weights(args.output_dir)
-
-            # run inference
-            generator = torch.Generator(device=accelerator.device)
-            if args.seed is not None:
-                generator = generator.manual_seed(args.seed)
-            images = []
-            with torch.autocast(accelerator.device.type):
-                for _ in range(args.num_validation_images):
-                    images.append(pipeline(args.validation_prompt, num_inference_steps=30, generator=generator).images[0])
-            for tracker in accelerator.trackers:
-                if len(images) != 0:
-                    if tracker.name == "tensorboard":
-                        np_images = np.stack([np.asarray(img) for img in images])
-                        tracker.writer.add_images("test", np_images, epoch, dataformats="NHWC")
-                    if tracker.name == "wandb":
-                        tracker.log(
-                            {
-                                "test": [
-                                    wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                    for i, image in enumerate(images)
-                                ]
-                            }
-                        )
+        unet = unet.to(torch.float32)
+        unwrapped_unet = unwrap_model(unet)
+        unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet))
+        torch_path2 = os.path.join(args.output_dir, 'unet_lora_state_dict.pth')
+        torch.save(unet_lora_state_dict, torch_path2)
 
     accelerator.end_training()
 
 
 if __name__ == "__main__":
     main()
+
