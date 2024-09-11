@@ -17,20 +17,26 @@ for item in data:
     text = item['text']
     dictionary[file_name] = text[text.find(',') + 2:].split(' - ')
     sentences.append(text)
+embeddings = model.encode(sentences)
 
 
-def random_biom(biom):     # возвращает ссылку на карту / сообщение о том что ничего не найдено
+def random_biome(biome):
+    """
+    returns a link to a random map of the given biome
+    """
     point = random.randint(0, len(dictionary) - 1)
     for i in range(0, len(dictionary)):
         if point + i == len(dictionary):
             point = -i
-        if dictionary[list(dictionary.keys())[point+i]][0] == biom:
-            return list(dictionary.keys())[point+i]
-    return 'Карт данного биома не найдено'
+        if dictionary[list(dictionary.keys())[point + i]][0] == biome:
+            return list(dictionary.keys())[point + i]
+    return 'nothing was found'
 
 
-def similar_description(user_description):  # возвращает массив из трех ссылок на карты, по убыванию "подходящести"
-    embeddings = model.encode(sentences)
+def similar_description(user_description):
+    """
+    returns an array of three link to maps that best match the given description in descending order of suitability
+    """
     user_embedding = model.encode(user_description)
     cos_sim = util.cos_sim(embeddings, user_embedding)
     sim_arr = []
@@ -40,3 +46,4 @@ def similar_description(user_description):  # возвращает массив 
     ans = []
     for score, i in sim_arr[0:3]:
         ans.append("img/image_" + str(i + 1).zfill(3) + ".jpg")
+    return ans

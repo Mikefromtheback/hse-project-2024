@@ -5,7 +5,6 @@ import os
 import random
 import shutil
 from pathlib import Path
-
 import datasets
 import diffusers
 import numpy as np
@@ -19,23 +18,19 @@ from datasets import load_dataset
 from diffusers import DDPMScheduler, PriorTransformer
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_snr, cast_training_params
-from diffusers.utils import check_min_version, is_wandb_available, is_xformers_available, \
-    convert_state_dict_to_diffusers
-from peft import LoraConfig, get_peft_model_state_dict
+from diffusers.utils import is_wandb_available, is_xformers_available
+from peft import LoraConfig
 from torch.utils import data
 from packaging import version
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPTextModelWithProjection, CLIPTokenizer, CLIPVisionModelWithProjection
 from transformers.utils import logging as hf_logging
-from diffusers.utils.torch_utils import is_compiled_module
-
-# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.28.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Example of finetuning Kandinsky 2.2 with LoRA.")
+    parser = argparse.ArgumentParser(description="Finetuning Kandinsky 2.2 with LoRA.")
     parser.add_argument(
         "--pretrained_decoder_model_name_or_path",
         type=str,
@@ -95,7 +90,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="kandi_2_2-model-finetuned-lora",
+        default="kandi_2_2-prior-finetuned-lora",
         help="The output directory where the model predictions and checkpoints will be written."
     )
     parser.add_argument(
@@ -156,7 +151,7 @@ def parse_args():
         )
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps_ratio", type=float, default=0.05, help="Ratio of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
         "--snr_gamma",
@@ -220,12 +215,11 @@ def parse_args():
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
-        "--checkpointing_steps",
-        type=int,
-        default=500,
+        "--checkpointing_steps_ratio",
+        type=float,
+        default=0.25,
         help=(
-            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
-            " training using `--resume_from_checkpoint`."
+            "Save a checkpoint of the training state every X of steps."
         )
     )
     parser.add_argument(
@@ -233,15 +227,6 @@ def parse_args():
         type=int,
         default=None,
         help="Max number of checkpoints to store."
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help=(
-            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
-        )
     )
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
@@ -252,43 +237,31 @@ def parse_args():
         default=4,
         help="The dimension of the LoRA update matrices."
     )
-
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
-
-    # Sanity checks
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
-
     return args
 
 
 def main():
     args = parse_args()
-
     logging_dir = Path(args.output_dir, args.logging_dir)
-
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
-
-    # Disable AMP for MPS.
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
-
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
         import wandb
-
-    # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -303,17 +276,11 @@ def main():
         datasets.utils.logging.set_verbosity_error()
         hf_logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
-
-    # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
-
-    # Handle the repository creation
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
-
-    # Load scheduler, image_processor, tokenizer and models.
     noise_scheduler = DDPMScheduler(beta_schedule="squaredcos_cap_v2", prediction_type="sample")
     tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_prior_model_name_or_path, subfolder="tokenizer")
     image_processor = CLIPImageProcessor.from_pretrained(
@@ -326,7 +293,6 @@ def main():
         args.pretrained_prior_model_name_or_path, subfolder="text_encoder"
     )
     prior = PriorTransformer.from_pretrained(args.pretrained_prior_model_name_or_path, subfolder="prior")
-    # freeze parameters of models to save more memory
     image_encoder.requires_grad_(False)
     prior.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -335,31 +301,23 @@ def main():
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
-
     for param in prior.parameters():
         param.requires_grad_(False)
-
     prior_lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.rank,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
-
-    # Move image_encoder, text_encoder and prior to device and cast to weight_dtype
     prior.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
-
     prior.add_adapter(prior_lora_config)
-
     if args.mixed_precision == "fp16":
-        # only upcast trainable parameters (LoRA) into fp32
         cast_training_params(prior, dtype=torch.float32)
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
-
             xformers_version = version.parse(xformers.__version__)
             if xformers_version == version.parse("0.0.16"):
                 logger.warning(
@@ -368,35 +326,25 @@ def main():
             prior.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
-
     lora_layers = filter(lambda p: p.requires_grad, prior.parameters())
-
     if args.gradient_checkpointing:
         prior.enable_gradient_checkpointing()
-
-    # Enable TF32 for faster training on Ampere GPUs,
-    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
-
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+                args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
-
-    # Initialize the optimizer
     if args.use_8bit_adam:
         try:
             import bitsandbytes as bnb
         except ImportError:
             raise ImportError(
-                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
+                "Install bitsandbytes to use 8-bit Adam."
             )
-
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
-
     optimizer = optimizer_cls(
         lora_layers,
         lr=args.learning_rate,
@@ -404,14 +352,7 @@ def main():
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
     if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
             args.dataset_name,
             args.dataset_config_name,
@@ -427,14 +368,7 @@ def main():
             data_files=data_files,
             cache_dir=args.cache_dir,
         )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
     column_names = dataset["train"].column_names
-
-    # Get the column names for input/target.
     image_column = args.image_column
     if image_column not in column_names:
         raise ValueError(f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}")
@@ -444,15 +378,12 @@ def main():
             f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
         )
 
-    # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
     def tokenize_captions(examples, is_train=True):
         captions = []
         for caption in examples[caption_column]:
             if isinstance(caption, str):
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
                 captions.append(random.choice(caption) if is_train else caption[0])
             else:
                 raise ValueError(
@@ -465,11 +396,6 @@ def main():
         text_mask = inputs.attention_mask.bool()
         return text_input_ids, text_mask
 
-    def unwrap_model(model):
-        model = accelerator.unwrap_model(model)
-        model = model._orig_mod if is_compiled_module(model) else model
-        return model
-
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["clip_pixel_values"] = image_processor(images, return_tensors="pt").pixel_values
@@ -479,7 +405,6 @@ def main():
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
@@ -489,7 +414,6 @@ def main():
         text_mask = torch.stack([example["text_mask"] for example in examples])
         return {"clip_pixel_values": clip_pixel_values, "text_input_ids": text_input_ids, "text_mask": text_mask}
 
-    # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -497,18 +421,16 @@ def main():
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
-
-    # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
-
+    lr_warmup_steps = math.ceil(args.lr_warmup_steps_ratio * num_update_steps_per_epoch)
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_warmup_steps=lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
     clip_mean = prior.clip_mean.clone()
@@ -516,22 +438,13 @@ def main():
     prior, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         prior, optimizer, train_dataloader, lr_scheduler
     )
-
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("text2image-fine-tune", config=vars(args))
-
-    # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
@@ -541,51 +454,20 @@ def main():
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
-
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
-
-        if path is None:
-            accelerator.print(
-                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
-            )
-            args.resume_from_checkpoint = None
-            initial_global_step = 0
-        else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
-            global_step = int(path.split("-")[1])
-
-            initial_global_step = global_step
-            first_epoch = global_step // num_update_steps_per_epoch
-    else:
-        initial_global_step = 0
-
+    initial_global_step = 0
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
         desc="Steps",
-        # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
     clip_mean = clip_mean.to(weight_dtype).to(accelerator.device)
     clip_std = clip_std.to(weight_dtype).to(accelerator.device)
-
     for epoch in range(first_epoch, args.num_train_epochs):
         prior.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(prior):
-                # Convert images to latent space
                 text_input_ids, text_mask, clip_images = (
                     batch["text_input_ids"],
                     batch["text_mask"],
@@ -595,22 +477,16 @@ def main():
                     text_encoder_output = text_encoder(text_input_ids)
                     prompt_embeds = text_encoder_output.text_embeds
                     text_encoder_hidden_states = text_encoder_output.last_hidden_state
-
                     image_embeds = image_encoder(clip_images).image_embeds
-                    # Sample noise that we'll add to the image_embeds
                     noise = torch.randn_like(image_embeds)
                     bsz = image_embeds.shape[0]
-                    # Sample a random timestep for each image
                     timesteps = torch.randint(
                         0, noise_scheduler.config['num_train_timesteps'], (bsz,), device=image_embeds.device
                     )
                     timesteps = timesteps.long()
                     image_embeds = (image_embeds - clip_mean) / clip_std
                     noisy_latents = noise_scheduler.add_noise(image_embeds, noise, timesteps)
-
                     target = image_embeds
-
-                # Predict the noise residual and compute loss
                 model_pred = prior(
                     noisy_latents,
                     timestep=timesteps,
@@ -619,13 +495,9 @@ def main():
                     attention_mask=text_mask,
                     return_dict=False
                 )[0]
-
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
                     snr = compute_snr(noise_scheduler, timesteps)
                     mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
                         dim=1
@@ -633,75 +505,42 @@ def main():
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
-
-                # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
-
-                # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(lora_layers, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
-
-                if global_step % args.checkpointing_steps == 0:
+                if global_step % math.ceil(args.checkpointing_steps_ratio * args.max_train_steps) == 0:
                     if accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
                             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= args.checkpoints_total_limit:
                                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
                                 removing_checkpoints = checkpoints[0:num_to_remove]
-
                                 logger.info(
                                     f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
                                 )
                                 logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
-
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        torch_path = os.path.join(save_path, 'prior_lora_state_dict.pth')
-                        accelerator.save_state(save_path)
-
-                        unwrapped_prior = unwrap_model(prior)
-                        prior_lora_state_dict = convert_state_dict_to_diffusers(
-                            get_peft_model_state_dict(unwrapped_prior)
-                        )
-                        torch.save(prior_lora_state_dict, torch_path)
+                        accelerator.save_model(prior, save_path)
                         logger.info(f"Saved state to {save_path}")
-
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
-
             if global_step >= args.max_train_steps:
                 break
-
-
-    # Save the lora layers
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        prior = prior.to(torch.float32)
-        unwrapped_prior = unwrap_model(prior)
-        prior_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_prior))
-        torch_path2 = os.path.join(args.output_dir, 'prior_lora_state_dict.pth')
-        torch.save(prior_lora_state_dict, torch_path2)
-
     accelerator.end_training()
 
 
